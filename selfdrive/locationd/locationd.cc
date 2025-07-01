@@ -196,6 +196,16 @@ VectorXd Localizer::get_stdev() {
 }
 
 void Localizer::handle_sensors(double current_time, const capnp::List<cereal::SensorEventData, capnp::Kind::STRUCT>::Reader& log) {
+  // one‐time clock offset calibration
+  static bool first_calib = true;
+  static double time_offset = 0.0;
+  if (first_calib && log.size() > 0) {
+    // log[0] is the first SensorEventData in this batch
+    double first_ts = 1e-9 * log[0].getTimestamp();
+    time_offset = current_time - first_ts;
+    first_calib = false;
+  }
+
   // TODO does not yet account for double sensor readings in the log
   for (int i = 0; i < log.size(); i++) {
     const cereal::SensorEventData::Reader& sensor_reading = log[i];
@@ -205,7 +215,7 @@ void Localizer::handle_sensors(double current_time, const capnp::List<cereal::Se
       continue;
     }
 
-    double sensor_time = 1e-9 * sensor_reading.getTimestamp();
+    double sensor_time = 1e-9 * sensor_reading.getTimestamp() + time_offset;
 
     // sensor time and log time should be close
     if (std::abs(current_time - sensor_time) > 0.1) {
@@ -288,6 +298,8 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
   this->unix_timestamp_millis = log.getTimestamp();
   double gps_est_error = (this->kf->get_x().segment<STATE_ECEF_POS_LEN>(STATE_ECEF_POS_START) - ecef_pos).norm();
 
+
+
   VectorXd orientation_ecef = quat2euler(vector2quat(this->kf->get_x().segment<STATE_ECEF_ORIENTATION_LEN>(STATE_ECEF_ORIENTATION_START)));
   VectorXd orientation_ned = ned_euler_from_ecef({ ecef_pos(0), ecef_pos(1), ecef_pos(2) }, orientation_ecef);
   VectorXd orientation_ned_gps = Vector3d(0.0, 0.0, DEG2RAD(log.getBearingDeg()));
@@ -301,14 +313,34 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
   }
   VectorXd initial_pose_ecef_quat = quat2vector(euler2quat(ecef_euler_from_ned({ ecef_pos(0), ecef_pos(1), ecef_pos(2) }, orientation_ned_gps)));
 
+// ==== begin 2-fix GPS-jump hysteresis ====
+static int bad_gps_count = 0;
+if (gps_est_error > 100.0) {
+  bad_gps_count++;
+  if (bad_gps_count >= 2) {
+    LOGW("Persistent GPS jump (>100 m × 2), kalman reset");
+    this->reset_kalman(
+      NAN, initial_pose_ecef_quat,
+      ecef_pos, ecef_vel,
+      ecef_pos_R, ecef_vel_R
+    );
+    bad_gps_count = 0;
+  }
+} else {
+  bad_gps_count = 0;
+}
+// ==== end hysteresis ====
+
   if (ecef_vel.norm() > 5.0 && orientation_error.norm() > 1.0) {
     LOGE("Locationd vs ubloxLocation orientation difference too large, kalman reset");
     this->reset_kalman(NAN, initial_pose_ecef_quat, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
     this->kf->predict_and_observe(current_time, OBSERVATION_ECEF_ORIENTATION_FROM_GPS, { initial_pose_ecef_quat });
-  } else if (gps_est_error > 100.0) {
-    LOGE("Locationd vs ubloxLocation position difference too large, kalman reset");
-    this->reset_kalman(NAN, initial_pose_ecef_quat, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
   }
+// } else if (gps_est_error > 100.0) {
+//   LOGE("Locationd vs ubloxLocation position difference too large, kalman reset");
+//   this->reset_kalman(NAN, initial_pose_ecef_quat,
+//                     ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
+// }
 
   this->kf->predict_and_observe(current_time, OBSERVATION_ECEF_POS, { ecef_pos }, { ecef_pos_R });
   this->kf->predict_and_observe(current_time, OBSERVATION_ECEF_VEL, { ecef_vel }, { ecef_vel_R });
